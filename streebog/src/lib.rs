@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, unreachable_pub)]
 
+#[cfg(feature = "secret-input")]
+extern crate alloc;
+
 pub use digest::{self, Digest};
 
 /// Block-level types
@@ -33,3 +36,8 @@ digest::buffer_fixed!(
     oid: "1.2.643.7.1.1.2.3";
     impl: FixedHashTraits;
 );
+
+#[cfg(feature = "secret-input")]
+mod secret;
+#[cfg(feature = "secret-input")]
+pub use secret::{SecretCore, Streebog256Secret, Streebog512Secret};

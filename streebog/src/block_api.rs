@@ -17,144 +17,252 @@ use crate::consts::{BLOCK_SIZE, C64, SHUFFLED_LIN_TABLE};
 
 type Block = [u8; 64];
 
-/// Core block-level Streebog hasher with variable output size.
-///
-/// Supports initialization only for 32 and 64 byte output sizes,
-/// i.e. 256 and 512 bits respectively.
-#[derive(Clone)]
-pub struct StreebogVarCore {
+/// Ordinary upstream core; the alias preserves non-generic call inference.
+pub type StreebogVarCore = StreebogCore<false>;
+
+/// Shared Streebog core. Secret mode is available with `secret-input` only.
+/// Both modes reuse the same compression, constants and finalization.
+pub struct StreebogCore<const SECRET: bool> {
     h: [u64; 8],
     n: [u64; 8],
     sigma: [u64; 8],
 }
 
-#[inline(always)]
-fn lps(h: &mut [u64; 8], n: &[u64; 8]) {
-    for i in 0..8 {
-        h[i] ^= n[i];
-    }
+impl Clone for StreebogCore<false> {
+    fn clone(&self) -> Self { Self { h: self.h, n: self.n, sigma: self.sigma } }
+}
 
-    let mut buf = [0u64; 8];
-    #[allow(clippy::needless_range_loop)]
+/// One reusable operation workspace; secret owners allocate this before input.
+pub(crate) struct CompressionWorkspace<const SECRET: bool> {
+    message: [u64; 8],
+    key: [u64; 8],
+    block: [u64; 8],
+    lps: [u64; 8],
+    // Selected input byte and candidate contribution belong to the same
+    // cleared owner, not a readonly eight-word snapshot in the caller frame.
+    selector: [u64; 2],
+}
+impl<const SECRET: bool> Default for CompressionWorkspace<SECRET> {
+    fn default() -> Self {
+        Self { message: [0; 8], key: [0; 8], block: [0; 8], lps: [0; 8], selector: [0; 2] }
+    }
+}
+impl<const SECRET: bool> CompressionWorkspace<SECRET> {
+    fn clear(&mut self) {
+        #[cfg(feature = "zeroize")]
+        if SECRET {
+            self.message.zeroize();
+            self.key.zeroize();
+            self.block.zeroize();
+            self.lps.zeroize();
+            self.selector.zeroize();
+        }
+    }
+}
+impl<const SECRET: bool> Drop for CompressionWorkspace<SECRET> {
+    fn drop(&mut self) { self.clear(); }
+}
+
+struct WordsGuard<'a, const SECRET: bool, const LEN: usize = 8>(&'a mut [u64; LEN]);
+
+impl<const SECRET: bool, const LEN: usize> core::ops::Deref for WordsGuard<'_, SECRET, LEN> {
+    type Target = [u64; LEN];
+    fn deref(&self) -> &Self::Target { self.0 }
+}
+
+impl<const SECRET: bool, const LEN: usize> core::ops::DerefMut for WordsGuard<'_, SECRET, LEN> {
+    fn deref_mut(&mut self) -> &mut Self::Target { self.0 }
+}
+
+impl<const SECRET: bool, const LEN: usize> Drop for WordsGuard<'_, SECRET, LEN> {
+    fn drop(&mut self) {
+        #[cfg(feature = "zeroize")]
+        if SECRET { self.0.zeroize(); }
+    }
+}
+
+#[inline(always)]
+fn lps<const SECRET: bool>(
+    h: &mut [u64; 8], n: &[u64; 8], scratch: &mut [u64; 8], _selector: &mut [u64; 2],
+) {
+    for i in 0..8 { h[i] ^= n[i]; }
+    let mut buf = WordsGuard::<SECRET>(scratch);
+    buf.fill(0);
+    #[cfg(feature = "secret-input")]
+    let mut selected = WordsGuard::<SECRET, 2>(_selector);
     for i in 0..8 {
         for j in 0..8 {
+            #[cfg(feature = "secret-input")]
+            if SECRET {
+                use subtle::{ConditionallySelectable, ConstantTimeEq};
+                // The inspected pinned x64 code cached all eight transformed
+                // key words across this scan, then left those stack slots
+                // unwiped. Reload one public row through a MUTABLE source;
+                // per-candidate barriers keep selector/accumulator in their
+                // cleared workspace rather than an immutable word snapshot.
+                // This is a codegen candidate, not a spill-erasure guarantee.
+                let source = core::hint::black_box(&mut *h);
+                selected[0] = (source[j] >> (8 * i)) & 0xff;
+                for (candidate, value) in SHUFFLED_LIN_TABLE[j].iter().enumerate() {
+                    let selected = core::hint::black_box(&mut *selected);
+                    let choice = (candidate as u8).ct_eq(&(selected[0] as u8));
+                    selected[1] = u64::conditional_select(&0, value, choice);
+                    let accumulator = core::hint::black_box(&mut *buf);
+                    accumulator[i] ^= selected[1];
+                }
+                continue;
+            }
             let idx = ((h[j] >> (8 * i)) & 0xff) as usize;
             buf[i] ^= SHUFFLED_LIN_TABLE[j][idx];
         }
     }
-
-    *h = buf;
+    h.copy_from_slice(&*buf);
 }
 
-fn g(h: &mut [u64; 8], n: &[u64; 8], m: &[u64; 8]) {
-    let mut key = *h;
-    let mut block = *m;
-
-    lps(&mut key, n);
-
+#[inline(always)]
+fn g<const SECRET: bool>(h: &mut [u64; 8], n: &[u64; 8], work: &mut CompressionWorkspace<SECRET>) {
+    work.key.copy_from_slice(h);
+    work.block.copy_from_slice(&work.message);
+    lps::<SECRET>(&mut work.key, n, &mut work.lps, &mut work.selector);
     for c in &C64 {
-        lps(&mut block, &key);
-        lps(&mut key, c);
+        lps::<SECRET>(&mut work.block, &work.key, &mut work.lps, &mut work.selector);
+        lps::<SECRET>(&mut work.key, c, &mut work.lps, &mut work.selector);
     }
-
-    for i in 0..8 {
-        h[i] ^= block[i] ^ key[i] ^ m[i];
-    }
+    // Keep feed-forward input in its owned workspace rather than a separately
+    // hoisted eight-word copy across the secret compression calls. This is an
+    // optimizer barrier on the pointer, NOT proof of absence of scalar spills.
+    let work = if SECRET { core::hint::black_box(work) } else { work };
+    let h = if SECRET { core::hint::black_box(h) } else { h };
+    for i in 0..8 { h[i] ^= work.block[i] ^ work.key[i] ^ work.message[i]; }
 }
 
-impl StreebogVarCore {
+impl<const SECRET: bool> StreebogCore<SECRET> {
     #[inline(always)]
     fn update_sigma(&mut self, m: &[u64; 8]) {
         let mut carry = false;
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..8 {
-            adc(&mut self.sigma[i], m[i], &mut carry);
-        }
+        for i in 0..8 { adc(&mut self.sigma[i], m[i], &mut carry); }
     }
-
     #[inline(always)]
     fn update_n(&mut self, len: u64) {
         let mut carry = false;
-        // Note: `len` can not be bigger than block size, so `8 * len` never overflows
         adc(&mut self.n[0], 8 * len, &mut carry);
-        for i in 1..8 {
-            adc(&mut self.n[i], 0, &mut carry);
-        }
+        for i in 1..8 { adc(&mut self.n[i], 0, &mut carry); }
     }
-
     #[inline(always)]
-    fn compress(&mut self, block: &[u8; 64], msg_len: u64) {
-        let block = from_bytes(block);
-        g(&mut self.h, &self.n, &block);
+    fn compress_message(&mut self, msg_len: u64, work: &mut CompressionWorkspace<SECRET>) {
+        g::<SECRET>(&mut self.h, &self.n, work);
         self.update_n(msg_len);
-        self.update_sigma(&block);
+        self.update_sigma(&work.message);
+        work.clear();
     }
-}
-
-impl HashMarker for StreebogVarCore {}
-
-impl BlockSizeUser for StreebogVarCore {
-    type BlockSize = U64;
-}
-
-impl BufferKindUser for StreebogVarCore {
-    type BufferKind = Eager;
-}
-
-impl UpdateCore for StreebogVarCore {
-    #[inline]
-    fn update_blocks(&mut self, blocks: &[GenBlock<Self>]) {
+    #[inline(always)]
+    pub(crate) fn update_with_workspace(
+        &mut self, blocks: &[GenBlock<Self>], work: &mut CompressionWorkspace<SECRET>,
+    ) {
         for block in blocks {
-            self.compress(block.as_ref(), BLOCK_SIZE as u64);
+            for (word, bytes) in work.message.iter_mut().zip(block.chunks_exact(8)) {
+                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+            self.compress_message(BLOCK_SIZE as u64, work);
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn finish_with_workspace(
+        &mut self, buffer: &mut Buffer<Self>, out: &mut Output<Self>,
+        work: &mut CompressionWorkspace<SECRET>,
+    ) {
+        let pos = buffer.get_pos();
+        work.message.fill(0);
+        for (i, byte) in buffer.get_data().iter().enumerate() {
+            work.message[i / 8] |= u64::from(*byte) << (8 * (i % 8));
+        }
+        work.message[pos / 8] |= 1u64 << (8 * (pos % 8));
+        #[cfg(feature = "zeroize")]
+        if SECRET { buffer.zeroize(); }
+        buffer.reset();
+        self.compress_message(pos as u64, work);
+        work.message.copy_from_slice(&self.n);
+        g::<SECRET>(&mut self.h, &[0; 8], work);
+        work.clear();
+        work.message.copy_from_slice(&self.sigma);
+        g::<SECRET>(&mut self.h, &[0; 8], work);
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = (self.h[i / 8] >> (8 * (i % 8))) as u8;
+        }
+        work.clear();
+        #[cfg(feature = "zeroize")]
+        if SECRET {
+            self.h.zeroize();
+            self.n.zeroize();
+            self.sigma.zeroize();
         }
     }
 }
 
-impl OutputSizeUser for StreebogVarCore {
-    type OutputSize = U64;
+#[cfg(feature = "secret-input")]
+impl StreebogCore<true> {
+    pub(crate) fn copy_state_into(&self, target: &mut Self) {
+        target.h.copy_from_slice(&self.h);
+        target.n.copy_from_slice(&self.n);
+        target.sigma.copy_from_slice(&self.sigma);
+    }
 }
 
-impl VariableOutputCore for StreebogVarCore {
-    const TRUNC_SIDE: TruncSide = TruncSide::Right;
+impl<const SECRET: bool> HashMarker for StreebogCore<SECRET> {}
+impl<const SECRET: bool> BlockSizeUser for StreebogCore<SECRET> { type BlockSize = U64; }
+impl<const SECRET: bool> BufferKindUser for StreebogCore<SECRET> { type BufferKind = Eager; }
+impl<const SECRET: bool> OutputSizeUser for StreebogCore<SECRET> { type OutputSize = U64; }
 
-    #[inline]
+impl<const SECRET: bool> UpdateCore for StreebogCore<SECRET> {
+    fn update_blocks(&mut self, blocks: &[GenBlock<Self>]) {
+        #[cfg(feature = "secret-input")]
+        if SECRET {
+            // Raw block-level callers lack a retained workspace; one allocation
+            // per call, not per block. Public secret wrappers reuse their owner.
+            let mut work = alloc::boxed::Box::new(CompressionWorkspace::default());
+            self.update_with_workspace(blocks, &mut work);
+            return;
+        }
+        let mut work = CompressionWorkspace::default();
+        self.update_with_workspace(blocks, &mut work);
+    }
+}
+
+impl<const SECRET: bool> VariableOutputCore for StreebogCore<SECRET> {
+    const TRUNC_SIDE: TruncSide = TruncSide::Right;
     fn new(output_size: usize) -> Result<Self, InvalidOutputSize> {
+        #[cfg(not(feature = "secret-input"))]
+        if SECRET { return Err(InvalidOutputSize); }
         let h = match output_size {
             32 => [0x0101_0101_0101_0101; 8],
             64 => [0; 8],
             _ => return Err(InvalidOutputSize),
         };
-        let (n, sigma) = Default::default();
-        Ok(Self { h, n, sigma })
+        Ok(Self { h, n: [0; 8], sigma: [0; 8] })
     }
-
-    #[inline]
     fn finalize_variable_core(&mut self, buffer: &mut Buffer<Self>, out: &mut Output<Self>) {
-        let pos = buffer.get_pos();
-        let mut block = buffer.pad_with_zeros();
-        block[pos] = 1;
-        self.compress(block.as_ref(), pos as u64);
-        g(&mut self.h, &[0u64; 8], &self.n);
-        g(&mut self.h, &[0u64; 8], &self.sigma);
-        out.copy_from_slice(&to_bytes(&self.h));
+        #[cfg(feature = "secret-input")]
+        if SECRET {
+            let mut work = alloc::boxed::Box::new(CompressionWorkspace::default());
+            self.finish_with_workspace(buffer, out, &mut work);
+            return;
+        }
+        let mut work = CompressionWorkspace::default();
+        self.finish_with_workspace(buffer, out, &mut work);
     }
 }
 
-impl AlgorithmName for StreebogVarCore {
-    #[inline]
-    fn write_alg_name(f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Streebog")
-    }
+impl<const SECRET: bool> AlgorithmName for StreebogCore<SECRET> {
+    fn write_alg_name(f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("Streebog") }
 }
 
-impl fmt::Debug for StreebogVarCore {
-    #[inline]
+impl fmt::Debug for StreebogCore<false> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("StreebogVarCore { ... }")
     }
 }
 
-impl Drop for StreebogVarCore {
+impl<const SECRET: bool> Drop for StreebogCore<SECRET> {
     fn drop(&mut self) {
         #[cfg(feature = "zeroize")]
         {
@@ -166,22 +274,21 @@ impl Drop for StreebogVarCore {
 }
 
 #[cfg(feature = "zeroize")]
-impl ZeroizeOnDrop for StreebogVarCore {}
+impl<const SECRET: bool> ZeroizeOnDrop for StreebogCore<SECRET> {}
 
-impl SerializableState for StreebogVarCore {
+// The existing public mode keeps its upstream serialization API.
+// Secret cores/wrappers deliberately do not implement SerializableState.
+impl SerializableState for StreebogCore<false> {
     type SerializedStateSize = U192;
-
     fn serialize(&self) -> SerializedState<Self> {
         let ser_h: Array<u8, U64> = to_bytes(&self.h).into();
         let ser_n: Array<u8, U64> = to_bytes(&self.n).into();
         let ser_sigma: Array<u8, U64> = to_bytes(&self.sigma).into();
         ser_h.concat(ser_n).concat(ser_sigma)
     }
-
     fn deserialize(ser_state: &SerializedState<Self>) -> Result<Self, DeserializeStateError> {
         let (ser_h, rem) = ser_state.split::<U64>();
         let (ser_n, ser_sigma) = rem.split::<U64>();
-
         Ok(Self {
             h: from_bytes(&ser_h.into()),
             n: from_bytes(&ser_n.into()),
@@ -197,7 +304,7 @@ fn adc(v1: &mut u64, v2: u64, carry: &mut bool) {
     let (a, b) = v1.overflowing_add(v2);
     let (c, d) = a.overflowing_add(*carry as u64);
     *v1 = c;
-    *carry = b || d;
+    *carry = b | d;
 }
 
 #[inline(always)]
@@ -251,5 +358,77 @@ mod tests {
         let before = core.n;
         core.update_n(0);
         assert_eq!(core.n, before);
+    }
+}
+
+#[cfg(all(test, feature = "secret-input"))]
+mod secret_cleanup_tests {
+    use super::WordsGuard;
+
+    #[test]
+    fn scratch_drop_clears_live_backing_storage() {
+        let mut words = [u64::MAX; 8];
+        { let _guard = WordsGuard::<true>(&mut words); }
+        assert_eq!(words, [0; 8]);
+    }
+
+    #[test]
+    fn scratch_unwind_clears_live_backing_storage() {
+        extern crate std;
+        let mut words = [u64::MAX; 8];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WordsGuard::<true>(&mut words);
+            panic!("synthetic unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(words, [0; 8]);
+    }
+
+    #[test]
+    fn secret_finalize_clears_actual_live_core_before_return() {
+        use super::{Buffer, Output, StreebogCore, VariableOutputCore};
+        use hex_literal::hex;
+        // RFC6986 M1/256, full bit-vector literals reversed once into bytes.
+        let mut message = hex!(
+            "32313039383736353433323130393837"
+            "36353433323130393837363534333231"
+            "30393837363534333231303938373635"
+            "343332313039383736353433323130");
+        message.reverse();
+        let mut expected = hex!("00557be5e584fd52a449b16b0251d05d"
+            "27f94ab76cbaa6da890b59d8ef1e159d");
+        expected.reverse();
+        let mut core = StreebogCore::<true>::new(32).unwrap();
+        let mut buffer = Buffer::<StreebogCore<true>>::try_new(&message).unwrap();
+        let mut output = Output::<StreebogCore<true>>::default();
+        core.finalize_variable_core(&mut buffer, &mut output);
+        assert_eq!(&output[32..], expected.as_slice());
+        assert_eq!(core.h, [0; 8], "live finalizer source h was not cleared");
+        assert_eq!(core.n, [0; 8], "live finalizer source counter was not cleared");
+        assert_eq!(core.sigma, [0; 8], "live finalizer source sigma was not cleared");
+        assert!(buffer.get_data().is_empty());
+        // These are the real still-live owned fields, not a standalone dummy
+        // guard and not proof of absence of additional emitted stack spills.
+    }
+
+    #[test]
+    fn selector_owner_clear_covers_new_secret_fields() {
+        let mut work = super::CompressionWorkspace::<true>::default();
+        work.selector = [0xab, 0xfedc_ba98_7654_3210];
+        work.clear();
+        assert_eq!(work.selector, [0; 2]);
+    }
+
+    #[test]
+    fn selector_guard_unwind_clears_live_workspace() {
+        extern crate std;
+        let mut work = super::CompressionWorkspace::<true>::default();
+        work.selector = [0xab, 0xfedc_ba98_7654_3210];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WordsGuard::<true, 2>(&mut work.selector);
+            panic!("synthetic selector unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(work.selector, [0; 2]);
     }
 }
